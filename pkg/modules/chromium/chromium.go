@@ -114,10 +114,12 @@ const defaultDenyListPattern = `^file:(?!//\/tmp/).*`
 // Chromium is a module that provides both an [Api] and routes for converting
 // an HTML document to PDF.
 type Chromium struct {
-	autoStart      bool
-	disableRoutes  bool
-	maxConcurrency int64
-	args           browserArguments
+	autoStart              bool
+	disableRoutes          bool
+	maxConcurrency         int64
+	maxConsecutiveFailures int64
+	maxTaskDuration        time.Duration
+	args                   browserArguments
 
 	logger     *slog.Logger
 	browser    browser
@@ -522,6 +524,8 @@ func (mod *Chromium) Descriptor() gotenberg.ModuleDescriptor {
 			fs.Int64("chromium-max-queue-size", 0, "Maximum request queue size for Chromium. Set to 0 to disable this feature")
 			fs.Duration("chromium-idle-shutdown-timeout", 0, "Shutdown Chromium after being idle for the given duration. Set to 0 to disable this feature")
 			fs.Int64("chromium-max-concurrency", 6, "Maximum number of concurrent conversions. Chromium supports up to 6")
+			fs.Int64("chromium-max-consecutive-failures", 0, "Number of Chromium conversions failing in a row after which /health reports Chromium down, and Chromium restarts before the next conversion. Invalid input, timeouts, and cancellations do not count. A success or a restart resets the count. Set to 0 to disable this feature")
+			fs.Duration("chromium-max-task-duration", 0, "Report Chromium down in /health while a conversion has been running for longer than the given duration. Set it above the longest legitimate conversion. Set to 0 to disable this feature")
 			fs.Bool("chromium-auto-start", false, "Automatically launch Chromium upon initialization if set to true; otherwise, Chromium will start at the time of the first conversion")
 			fs.Duration("chromium-start-timeout", time.Duration(20)*time.Second, "Maximum duration to wait for Chromium to start or restart")
 			fs.Bool("chromium-allow-insecure-localhost", false, "Ignore TLS/SSL errors on localhost")
@@ -555,6 +559,8 @@ func (mod *Chromium) Provision(ctx *gotenberg.Context) error {
 	mod.autoStart = flags.MustBool("chromium-auto-start")
 	mod.disableRoutes = flags.MustBool("chromium-disable-routes")
 	mod.maxConcurrency = flags.MustInt64("chromium-max-concurrency")
+	mod.maxConsecutiveFailures = flags.MustInt64("chromium-max-consecutive-failures")
+	mod.maxTaskDuration = flags.MustDuration("chromium-max-task-duration")
 
 	binPath, ok := os.LookupEnv("CHROMIUM_BIN_PATH")
 	if !ok {
@@ -614,11 +620,13 @@ func (mod *Chromium) Provision(ctx *gotenberg.Context) error {
 	// Process.
 	mod.browser = newChromiumBrowser(mod.args)
 	supervisor, err := gotenberg.NewProcessSupervisor(mod.logger, "chromium", mod.browser, gotenberg.SupervisorOptions{
-		RestartAfter:        flags.MustInt64("chromium-restart-after"),
-		MaxQueueSize:        flags.MustInt64("chromium-max-queue-size"),
-		MaxConcurrency:      mod.maxConcurrency,
-		IdleShutdownTimeout: flags.MustDuration("chromium-idle-shutdown-timeout"),
-		ErrorType:           chromiumErrorType,
+		RestartAfter:           flags.MustInt64("chromium-restart-after"),
+		MaxQueueSize:           flags.MustInt64("chromium-max-queue-size"),
+		MaxConcurrency:         mod.maxConcurrency,
+		IdleShutdownTimeout:    flags.MustDuration("chromium-idle-shutdown-timeout"),
+		ErrorType:              chromiumErrorType,
+		MaxConsecutiveFailures: mod.maxConsecutiveFailures,
+		MaxTaskDuration:        mod.maxTaskDuration,
 	})
 	if err != nil {
 		return fmt.Errorf("create Chromium supervisor: %w", err)
@@ -678,6 +686,14 @@ func (mod *Chromium) Provision(ctx *gotenberg.Context) error {
 func (mod *Chromium) Validate() error {
 	if mod.maxConcurrency < 1 || mod.maxConcurrency > 6 {
 		return fmt.Errorf("chromium-max-concurrency must be between 1 and 6, got %d", mod.maxConcurrency)
+	}
+
+	if mod.maxConsecutiveFailures < 0 {
+		return fmt.Errorf("--chromium-max-consecutive-failures (env CHROMIUM_MAX_CONSECUTIVE_FAILURES) must be 0 (disabled) or more, got %d", mod.maxConsecutiveFailures)
+	}
+
+	if mod.maxTaskDuration < 0 {
+		return fmt.Errorf("--chromium-max-task-duration (env CHROMIUM_MAX_TASK_DURATION) must be 0 (disabled) or more, got %s", mod.maxTaskDuration)
 	}
 
 	if mod.args.enableEnvironmentProxy {

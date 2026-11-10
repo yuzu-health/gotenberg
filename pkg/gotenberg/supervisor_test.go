@@ -3,6 +3,7 @@ package gotenberg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -1498,4 +1499,291 @@ func newTestSupervisor(t *testing.T, logger *slog.Logger, process Process, resta
 	}
 
 	return ps.(*processSupervisor)
+}
+
+func TestProcessSupervisor_ConsecutiveFailures(t *testing.T) {
+	failure := errors.New("exit status 1")
+	invalidInput := fmt.Errorf("navigate: %w", ErrFiltered)
+
+	for _, tc := range []struct {
+		scenario               string
+		maxConsecutiveFailures int64
+		taskErrors             []error
+		expectHealthy          []bool
+	}{
+		{
+			scenario:               "disabled by default",
+			maxConsecutiveFailures: 0,
+			taskErrors:             []error{failure, failure, failure, failure, failure},
+			expectHealthy:          []bool{true, true, true, true, true},
+		},
+		{
+			scenario:               "negative value disables it",
+			maxConsecutiveFailures: -1,
+			taskErrors:             []error{failure, failure},
+			expectHealthy:          []bool{true, true},
+		},
+		{
+			scenario:               "trips at the maximum",
+			maxConsecutiveFailures: 3,
+			taskErrors:             []error{failure, failure, failure},
+			expectHealthy:          []bool{true, true, false},
+		},
+		{
+			scenario:               "a success resets the count",
+			maxConsecutiveFailures: 2,
+			taskErrors:             []error{failure, nil, failure, nil, failure},
+			expectHealthy:          []bool{true, true, true, true, true},
+		},
+		{
+			scenario:               "request-caused failures neither count nor reset",
+			maxConsecutiveFailures: 2,
+			taskErrors: []error{
+				failure,
+				invalidInput,
+				fmt.Errorf("convert: %w", context.DeadlineExceeded),
+				fmt.Errorf("convert: %w", context.Canceled),
+				failure,
+			},
+			expectHealthy: []bool{true, true, true, true, false},
+		},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			logger := slog.New(slog.DiscardHandler)
+			process := &ProcessMock{
+				StartMock:   func(context.Context, *slog.Logger) error { return nil },
+				StopMock:    func(*slog.Logger) error { return nil },
+				HealthyMock: func(*slog.Logger) bool { return true },
+			}
+
+			s, err := NewProcessSupervisor(logger, "test", process, SupervisorOptions{
+				MaxConsecutiveFailures: tc.maxConsecutiveFailures,
+			})
+			if err != nil {
+				t.Fatalf("create supervisor: %v", err)
+			}
+
+			for i, taskErr := range tc.taskErrors {
+				err = s.Run(context.Background(), logger, func() error { return taskErr })
+				if !errors.Is(err, taskErr) {
+					t.Fatalf("task %d: expected error %v, got %v", i, taskErr, err)
+				}
+
+				if got := s.Healthy(); got != tc.expectHealthy[i] {
+					t.Errorf("after task %d (%v): expected healthy=%t, got %t", i, taskErr, tc.expectHealthy[i], got)
+				}
+			}
+		})
+	}
+}
+
+// TestProcessSupervisor_ConsecutiveFailures_RestartsBeforeNextTask covers the
+// recovery path: once tripped, the next task gets a fresh process, and the
+// restart clears the count, so the supervisor reports healthy again.
+func TestProcessSupervisor_ConsecutiveFailures_RestartsBeforeNextTask(t *testing.T) {
+	recorder := newTestSpanRecorder(t)
+	logger := slog.New(slog.DiscardHandler)
+
+	var starts, stops atomic.Int64
+	process := &ProcessMock{
+		StartMock: func(context.Context, *slog.Logger) error {
+			starts.Add(1)
+			return nil
+		},
+		StopMock: func(*slog.Logger) error {
+			stops.Add(1)
+			return nil
+		},
+		HealthyMock: func(*slog.Logger) bool { return true },
+	}
+
+	ps, err := NewProcessSupervisor(logger, "test", process, SupervisorOptions{MaxConsecutiveFailures: 2})
+	if err != nil {
+		t.Fatalf("create supervisor: %v", err)
+	}
+	s := ps.(*processSupervisor)
+
+	failure := errors.New("exit status 1")
+	for range 2 {
+		_ = s.Run(context.Background(), logger, func() error { return failure })
+	}
+
+	if s.Healthy() {
+		t.Fatal("expected unhealthy after 2 consecutive failures")
+	}
+	if starts.Load() != 1 || stops.Load() != 0 {
+		t.Fatalf("expected the first start only so far, got %d start(s), %d stop(s)", starts.Load(), stops.Load())
+	}
+
+	var ranOnFreshProcess bool
+	err = s.Run(context.Background(), logger, func() error {
+		ranOnFreshProcess = starts.Load() == 2 && stops.Load() == 1
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("run after trip: %v", err)
+	}
+	if !ranOnFreshProcess {
+		t.Errorf("expected the task to run on a restarted process, got %d start(s), %d stop(s)", starts.Load(), stops.Load())
+	}
+	if !s.Healthy() {
+		t.Error("expected healthy after the restart and a success")
+	}
+	if got := s.consecutiveFailures.Load(); got != 0 {
+		t.Errorf("expected the count reset, got %d", got)
+	}
+
+	var reasons []string
+	for _, span := range recorder.Ended() {
+		if span.Name() != "test.process.start" {
+			continue
+		}
+		for _, kv := range span.Attributes() {
+			if string(kv.Key) == "gotenberg.process.start.reason" {
+				reasons = append(reasons, kv.Value.AsString())
+			}
+		}
+	}
+	if len(reasons) != 2 || reasons[1] != restartReasonConsecutiveFailures {
+		t.Errorf("expected start reasons [first_start consecutive_failures], got %v", reasons)
+	}
+}
+
+func TestProcessSupervisor_ConsecutiveFailures_RestartResetsCount(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	process := &ProcessMock{
+		StartMock:   func(context.Context, *slog.Logger) error { return nil },
+		StopMock:    func(*slog.Logger) error { return nil },
+		HealthyMock: func(*slog.Logger) bool { return true },
+	}
+
+	ps, err := NewProcessSupervisor(logger, "test", process, SupervisorOptions{MaxConsecutiveFailures: 1})
+	if err != nil {
+		t.Fatalf("create supervisor: %v", err)
+	}
+	s := ps.(*processSupervisor)
+	s.firstStart.Store(true)
+	s.consecutiveFailures.Store(5)
+
+	err = s.restart(context.Background())
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if got := s.consecutiveFailures.Load(); got != 0 {
+		t.Errorf("expected restart to reset the count, got %d", got)
+	}
+}
+
+func TestProcessSupervisor_MaxTaskDuration(t *testing.T) {
+	for _, tc := range []struct {
+		scenario        string
+		maxTaskDuration time.Duration
+		expectOverdue   bool
+	}{
+		{scenario: "disabled by default", maxTaskDuration: 0, expectOverdue: false},
+		{scenario: "negative value disables it", maxTaskDuration: -time.Second, expectOverdue: false},
+		{scenario: "trips past the maximum", maxTaskDuration: 50 * time.Millisecond, expectOverdue: true},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			logger := slog.New(slog.DiscardHandler)
+			process := &ProcessMock{
+				StartMock:   func(context.Context, *slog.Logger) error { return nil },
+				StopMock:    func(*slog.Logger) error { return nil },
+				HealthyMock: func(*slog.Logger) bool { return true },
+			}
+
+			s, err := NewProcessSupervisor(logger, "test", process, SupervisorOptions{
+				MaxConcurrency:  2,
+				MaxTaskDuration: tc.maxTaskDuration,
+			})
+			if err != nil {
+				t.Fatalf("create supervisor: %v", err)
+			}
+
+			started := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				done <- s.Run(context.Background(), logger, func() error {
+					close(started)
+					<-release
+					return nil
+				})
+			}()
+			<-started
+
+			if !s.Healthy() {
+				t.Error("expected healthy while the task is within the maximum duration")
+			}
+
+			// A short task alongside the slow one must not mask it.
+			err = s.Run(context.Background(), logger, func() error { return nil })
+			if err != nil {
+				t.Fatalf("concurrent run: %v", err)
+			}
+
+			time.Sleep(100 * time.Millisecond)
+
+			if got := s.Healthy(); got == tc.expectOverdue {
+				t.Errorf("expected healthy=%t while the task runs for 100ms, got %t", !tc.expectOverdue, got)
+			}
+
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatalf("run: %v", err)
+			}
+
+			if !s.Healthy() {
+				t.Error("expected healthy once the overdue task returned")
+			}
+		})
+	}
+}
+
+// TestProcessSupervisor_TaskHealth_Concurrent exercises the counters while
+// Healthy reads them, for the race detector.
+func TestProcessSupervisor_TaskHealth_Concurrent(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	process := &ProcessMock{
+		StartMock:   func(context.Context, *slog.Logger) error { return nil },
+		StopMock:    func(*slog.Logger) error { return nil },
+		HealthyMock: func(*slog.Logger) bool { return true },
+	}
+
+	s, err := NewProcessSupervisor(logger, "test", process, SupervisorOptions{
+		MaxConcurrency:         4,
+		MaxConsecutiveFailures: 3,
+		MaxTaskDuration:        time.Second,
+	})
+	if err != nil {
+		t.Fatalf("create supervisor: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var probes sync.WaitGroup
+	probes.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.Healthy()
+			}
+		}
+	})
+
+	var runs sync.WaitGroup
+	for i := range 50 {
+		runs.Go(func() {
+			_ = s.Run(context.Background(), logger, func() error {
+				if i%2 == 0 {
+					return errors.New("exit status 1")
+				}
+				return nil
+			})
+		})
+	}
+	runs.Wait()
+	close(stop)
+	probes.Wait()
 }
