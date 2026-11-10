@@ -61,8 +61,10 @@ type ProcessSupervisor interface {
 	//
 	// A non-started process is considered healthy (startup is deferred until
 	// the first request), as is one going through a planned restart, since it
-	// keeps serving traffic. Returns false during an unplanned restart or when
-	// the underlying [Process] reports unhealthy.
+	// keeps serving traffic. Returns false during an unplanned restart, when
+	// the underlying [Process] reports unhealthy, or when the runs trip
+	// [SupervisorOptions.MaxConsecutiveFailures] or
+	// [SupervisorOptions.MaxTaskDuration].
 	Healthy() bool
 
 	// Run executes a provided task while managing the state of the [Process].
@@ -104,6 +106,17 @@ type SupervisorOptions struct {
 	// and gotenberg.<engine>.queue.wait.duration metrics. It defaults to
 	// [ClassifyError].
 	ErrorType func(error) string
+
+	// MaxConsecutiveFailures reports the process unhealthy once this number
+	// of tasks fail in a row, and restarts it before the next task. A task
+	// whose ErrorType is [ErrorTypeInvalidInput], [ErrorTypeTimeout] or
+	// [ErrorTypeContextCancelled] neither counts nor resets the count. A
+	// successful task and every (re)start reset it. 0 disables it.
+	MaxConsecutiveFailures int64
+
+	// MaxTaskDuration reports the process unhealthy while a task has been
+	// running for longer than this duration. 0 disables it.
+	MaxTaskDuration time.Duration
 }
 
 // healthCheckCacheTTL caches successful health probe results so kubelet-
@@ -129,9 +142,10 @@ const healthFailureThreshold = 2
 // process that reached its conversion limit, so the node keeps serving
 // traffic throughout. The others signal a process that cannot serve.
 const (
-	restartReasonFirstStart  = "first_start"
-	restartReasonUnhealthy   = "unhealthy"
-	restartReasonMaxRequests = "max_requests"
+	restartReasonFirstStart          = "first_start"
+	restartReasonUnhealthy           = "unhealthy"
+	restartReasonMaxRequests         = "max_requests"
+	restartReasonConsecutiveFailures = "consecutive_failures"
 )
 
 // defaultEagerRestartTimeout bounds the restart triggered after the maximum
@@ -187,6 +201,24 @@ type processSupervisor struct {
 	eagerRestartTimeout time.Duration
 	errorType           func(error) string
 	metrics             runMetrics
+	// consecutiveFailures counts the tasks failing in a row. A crash already
+	// triggers a restart, which resets it, so it only grows on a process that
+	// still looks alive to [Process.Healthy].
+	maxConsecutiveFailures int64
+	consecutiveFailures    atomic.Int64
+	maxTaskDuration        time.Duration
+	// tasksMu protects tasks, the tasks running, which [processSupervisor.Healthy]
+	// scans for one past maxTaskDuration. There are at most maxConcurrency.
+	tasksMu sync.Mutex
+	tasks   map[*runningTask]struct{}
+}
+
+// runningTask is a task that [processSupervisor.Run] is executing.
+type runningTask struct {
+	start time.Time
+	// overdueLogged makes the warning about a task past maxTaskDuration fire
+	// once per task, not once per health probe.
+	overdueLogged bool
 }
 
 // NewProcessSupervisor initializes a new [ProcessSupervisor]. engine names the
@@ -216,6 +248,10 @@ func NewProcessSupervisor(logger *slog.Logger, engine string, process Process, o
 		idleShutdownTimeout: opts.IdleShutdownTimeout,
 		eagerRestartTimeout: defaultEagerRestartTimeout,
 		errorType:           opts.ErrorType,
+		// A negative value disables the checks, as 0 does.
+		maxConsecutiveFailures: max(opts.MaxConsecutiveFailures, 0),
+		maxTaskDuration:        max(opts.MaxTaskDuration, 0),
+		tasks:                  make(map[*runningTask]struct{}),
 	}
 
 	metrics, err := newRunMetrics(s)
@@ -277,6 +313,9 @@ func (s *processSupervisor) restart(ctx context.Context) error {
 	// that will not start is ensureHealthy's job: it restarts synchronously
 	// before running a task, and reports the failure to the caller.
 	s.reqCounter.Store(0)
+	// A fresh process gets a clean slate, so that a tripped count does not
+	// restart it again before every task until one succeeds.
+	s.consecutiveFailures.Store(0)
 
 	err = s.Launch(ctx)
 	if err != nil {
@@ -296,6 +335,12 @@ func (s *processSupervisor) Healthy() bool {
 		// Reporting unhealthy here would cause container orchestrators to
 		// restart the pod before any request arrives.
 		return true
+	}
+
+	// Checked before the restart state: an overdue task is a stuck process
+	// even while a planned restart waits for it to drain.
+	if s.failing() || s.overdue() {
+		return false
 	}
 
 	if s.isRestarting.Load() {
@@ -425,7 +470,10 @@ func (s *processSupervisor) Run(ctx context.Context, logger *slog.Logger, task f
 
 			endQueueWait()
 			measure.taskStarted()
+			untrack := s.trackTask()
 			err := task()
+			untrack()
+			s.recordTaskResult(ctx, logger, err)
 
 			if s.maybeRestartAfterTask(logger) {
 				semaphoreOwned = false
@@ -540,6 +588,7 @@ func (s *processSupervisor) maybeIdleShutdown() {
 	// Reset state so ensureStarted() re-launches on next request.
 	s.firstStart.Store(false)
 	s.reqCounter.Store(0)
+	s.consecutiveFailures.Store(0)
 
 	s.logger.DebugContext(context.Background(), "process stopped due to idle timeout")
 }
@@ -613,20 +662,119 @@ func (s *processSupervisor) tracedLaunch(ctx context.Context, reason string, lau
 }
 
 // ensureHealthy checks the underlying process health and triggers a
-// synchronous restart if the process is unhealthy. Skips the check if a
+// synchronous restart if the process is unhealthy, or if the previous tasks
+// tripped [SupervisorOptions.MaxConsecutiveFailures]. Skips the check if a
 // restart is already in progress.
+//
+// An overdue task does not trigger a restart: the restart would have to
+// drain it first, and the task returns once its context is done anyway.
 func (s *processSupervisor) ensureHealthy(ctx context.Context) error {
-	if s.isRestarting.Load() || s.process.Healthy(s.logger) {
+	if s.isRestarting.Load() {
 		return nil
 	}
 
-	s.logger.DebugContext(context.Background(), "process is unhealthy, cannot handle task, restarting...")
+	reason := restartReasonUnhealthy
+	switch {
+	case s.failing():
+		reason = restartReasonConsecutiveFailures
+		s.logger.DebugContext(ctx, "too many consecutive task failures, restarting...")
+	case s.process.Healthy(s.logger):
+		return nil
+	default:
+		s.logger.DebugContext(ctx, "process is unhealthy, cannot handle task, restarting...")
+	}
 
-	if err := s.doRestart(ctx, restartReasonUnhealthy); err != nil {
+	if err := s.doRestart(ctx, reason); err != nil {
 		return fmt.Errorf("process restart before task: %w", err)
 	}
 
 	return nil
+}
+
+// trackTask registers a task as running for [processSupervisor.overdue], and
+// returns the function that unregisters it. It does nothing unless
+// [SupervisorOptions.MaxTaskDuration] is set.
+func (s *processSupervisor) trackTask() func() {
+	if s.maxTaskDuration <= 0 {
+		return func() {}
+	}
+
+	t := &runningTask{start: time.Now()}
+
+	s.tasksMu.Lock()
+	s.tasks[t] = struct{}{}
+	s.tasksMu.Unlock()
+
+	return func() {
+		s.tasksMu.Lock()
+		delete(s.tasks, t)
+		s.tasksMu.Unlock()
+	}
+}
+
+// overdue reports whether a task has been running for longer than
+// [SupervisorOptions.MaxTaskDuration].
+func (s *processSupervisor) overdue() bool {
+	if s.maxTaskDuration <= 0 {
+		return false
+	}
+
+	s.tasksMu.Lock()
+	defer s.tasksMu.Unlock()
+
+	for t := range s.tasks {
+		elapsed := time.Since(t.start)
+		if elapsed <= s.maxTaskDuration {
+			continue
+		}
+
+		if !t.overdueLogged {
+			t.overdueLogged = true
+			s.logger.WarnContext(context.Background(), fmt.Sprintf("a %s task has been running for %s, longer than %s set by %s; /health reports %s down until it returns. If conversions this long are expected, raise it", s.engine, elapsed.Round(time.Second), s.maxTaskDuration, s.flagRef("max-task-duration"), s.engine))
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// recordTaskResult counts the consecutive task failures for
+// [processSupervisor.failing]. A failure that the request causes, such as an
+// invalid input, a timeout, or a cancellation, says nothing about the process:
+// it leaves the count as is.
+func (s *processSupervisor) recordTaskResult(ctx context.Context, logger *slog.Logger, err error) {
+	if s.maxConsecutiveFailures <= 0 {
+		return
+	}
+
+	if err == nil {
+		s.consecutiveFailures.Store(0)
+		return
+	}
+
+	switch s.errorType(err) {
+	case ErrorTypeInvalidInput, ErrorTypeTimeout, ErrorTypeContextCancelled:
+		return
+	}
+
+	if s.consecutiveFailures.Add(1) == s.maxConsecutiveFailures {
+		logger.WarnContext(ctx, fmt.Sprintf("%d %s tasks failed in a row, the maximum set by %s; /health reports %s down, and the process restarts before the next task. If client documents cause these failures, raise it", s.maxConsecutiveFailures, s.engine, s.flagRef("max-consecutive-failures"), s.engine))
+	}
+}
+
+// flagRef names the flag and the environment variable that set an option of
+// the supervisor, for operator-facing messages. The engines name these flags
+// after themselves, for example --libreoffice-max-task-duration.
+func (s *processSupervisor) flagRef(option string) string {
+	name := s.engine + "-" + option
+	return fmt.Sprintf("--%s (env %s)", name, EnvVarName(name))
+}
+
+// failing reports whether the consecutive task failures reached
+// [SupervisorOptions.MaxConsecutiveFailures].
+func (s *processSupervisor) failing() bool {
+	return s.maxConsecutiveFailures > 0 && s.consecutiveFailures.Load() >= s.maxConsecutiveFailures
 }
 
 // maybeRestartAfterTask checks if the maximum request limit has been reached
@@ -669,7 +817,7 @@ func (s *processSupervisor) doRestart(ctx context.Context, reason string) error 
 
 	// Concurrent tasks may all have found the process unhealthy: the first one
 	// through the lock restarts it, the others find it healthy again.
-	if s.process.Healthy(s.logger) {
+	if !s.failing() && s.process.Healthy(s.logger) {
 		return nil
 	}
 

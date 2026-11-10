@@ -29,6 +29,43 @@ Feature: /health
     Then the Gotenberg container should log the following entries:
       | "path":"/health" |
 
+  Scenario: GET /health (Task Health Checks)
+    Given I have a Gotenberg container with the following environment variable(s):
+      | LIBREOFFICE_MAX_CONSECUTIVE_FAILURES | 1   |
+      | LIBREOFFICE_MAX_TASK_DURATION        | 60s |
+      | CHROMIUM_MAX_CONSECUTIVE_FAILURES    | 1   |
+      | CHROMIUM_MAX_TASK_DURATION           | 60s |
+    When I make a "POST" request to Gotenberg at the "/forms/libreoffice/convert" endpoint with the following form data and header(s):
+      | files | testdata/page_1.docx | file |
+    Then the response status code should be 200
+    # An incorrect password is the client's fault: it must not count as a
+    # LibreOffice failure.
+    When I make a "POST" request to Gotenberg at the "/forms/libreoffice/convert" endpoint with the following form data and header(s):
+      | files    | testdata/protected_page_1.docx | file  |
+      | password | bar                            | field |
+    Then the response status code should be 400
+    When I make a "POST" request to Gotenberg at the "/forms/chromium/convert/html" endpoint with the following form data and header(s):
+      | files | testdata/page-1-html/index.html | file |
+    Then the response status code should be 200
+    When I make a "GET" request to Gotenberg at the "/health" endpoint
+    Then the response status code should be 200
+    Then the response body should match JSON:
+      """
+      {
+        "status": "up",
+        "details": {
+          "chromium": {
+            "status": "up",
+            "timestamp": "ignore"
+          },
+          "libreoffice": {
+            "status": "up",
+            "timestamp": "ignore"
+          }
+        }
+      }
+      """
+
   Scenario: GET /health (No Logging)
     Given I have a Gotenberg container with the following environment variable(s):
       | API_DISABLE_HEALTH_CHECK_ROUTE_TELEMETRY | true |

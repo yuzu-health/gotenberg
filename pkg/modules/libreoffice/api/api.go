@@ -54,8 +54,10 @@ var (
 
 // Api is a module that provides a [Converter] backed by LibreOffice.
 type Api struct {
-	autoStart bool
-	args      libreOfficeArguments
+	autoStart              bool
+	maxConsecutiveFailures int64
+	maxTaskDuration        time.Duration
+	args                   libreOfficeArguments
 
 	logger      *slog.Logger
 	libreOffice libreOffice
@@ -393,6 +395,8 @@ func (a *Api) Descriptor() gotenberg.ModuleDescriptor {
 			fs.Int64("libreoffice-restart-after", 10, "Number of conversions after which LibreOffice will automatically restart. Set to 0 to disable this feature")
 			fs.Int64("libreoffice-max-queue-size", 0, "Maximum request queue size for LibreOffice. Set to 0 to disable this feature")
 			fs.Duration("libreoffice-idle-shutdown-timeout", 0, "Shutdown LibreOffice after being idle for the given duration. Set to 0 to disable this feature")
+			fs.Int64("libreoffice-max-consecutive-failures", 0, "Number of LibreOffice conversion attempts failing in a row after which /health reports LibreOffice down, and LibreOffice restarts before the next attempt. Invalid input, timeouts, and cancellations do not count. A success or a restart resets the count. Set to 0 to disable this feature")
+			fs.Duration("libreoffice-max-task-duration", 0, "Report LibreOffice down in /health while a conversion attempt has been running for longer than the given duration. Set it above the longest legitimate conversion. Set to 0 to disable this feature")
 			fs.Bool("libreoffice-auto-start", false, "Automatically launch LibreOffice upon initialization if set to true; otherwise, LibreOffice will start at the time of the first conversion")
 			fs.Duration("libreoffice-start-timeout", time.Duration(20)*time.Second, "Maximum duration to wait for LibreOffice to start or restart")
 			fs.StringSlice("libreoffice-allow-list", []string{}, `Set the allowed URLs for the requests LibreOffice sends, using regular expressions - supports multiple values. `+outboundScope+`. A match bypasses --libreoffice-deny-private-ips (LIBREOFFICE_DENY_PRIVATE_IPS) and --libreoffice-deny-public-ips (LIBREOFFICE_DENY_PUBLIC_IPS), so terminate the host or the pattern also matches suffix hosts, for example ^https?://internal\.svc(:|/|$)`)
@@ -412,6 +416,8 @@ func (a *Api) Descriptor() gotenberg.ModuleDescriptor {
 func (a *Api) Provision(ctx *gotenberg.Context) error {
 	flags := ctx.ParsedFlags()
 	a.autoStart = flags.MustBool("libreoffice-auto-start")
+	a.maxConsecutiveFailures = flags.MustInt64("libreoffice-max-consecutive-failures")
+	a.maxTaskDuration = flags.MustDuration("libreoffice-max-task-duration")
 
 	libreOfficeBinPath, ok := os.LookupEnv("LIBREOFFICE_BIN_PATH")
 	if !ok {
@@ -447,10 +453,12 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 	// Process.
 	a.libreOffice = newLibreOfficeProcess(a.args)
 	supervisor, err := gotenberg.NewProcessSupervisor(a.logger, "libreoffice", a.libreOffice, gotenberg.SupervisorOptions{
-		RestartAfter:        flags.MustInt64("libreoffice-restart-after"),
-		MaxQueueSize:        flags.MustInt64("libreoffice-max-queue-size"),
-		IdleShutdownTimeout: flags.MustDuration("libreoffice-idle-shutdown-timeout"),
-		ErrorType:           libreofficeErrorType,
+		RestartAfter:           flags.MustInt64("libreoffice-restart-after"),
+		MaxQueueSize:           flags.MustInt64("libreoffice-max-queue-size"),
+		IdleShutdownTimeout:    flags.MustDuration("libreoffice-idle-shutdown-timeout"),
+		ErrorType:              libreofficeErrorType,
+		MaxConsecutiveFailures: a.maxConsecutiveFailures,
+		MaxTaskDuration:        a.maxTaskDuration,
 	})
 	if err != nil {
 		return fmt.Errorf("create LibreOffice supervisor: %w", err)
@@ -484,6 +492,14 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 // Validate validates the module properties.
 func (a *Api) Validate() error {
 	var err error
+
+	if a.maxConsecutiveFailures < 0 {
+		err = errors.Join(err, fmt.Errorf("--libreoffice-max-consecutive-failures (env LIBREOFFICE_MAX_CONSECUTIVE_FAILURES) must be 0 (disabled) or more, got %d", a.maxConsecutiveFailures))
+	}
+
+	if a.maxTaskDuration < 0 {
+		err = errors.Join(err, fmt.Errorf("--libreoffice-max-task-duration (env LIBREOFFICE_MAX_TASK_DURATION) must be 0 (disabled) or more, got %s", a.maxTaskDuration))
+	}
 
 	_, statErr := os.Stat(a.args.binPath)
 	if os.IsNotExist(statErr) {
